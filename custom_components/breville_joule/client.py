@@ -1,0 +1,343 @@
+"""Breville Joule API client."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import threading
+import urllib.parse
+from typing import Any
+
+import aiohttp
+import jwt
+from websocket import WebSocketApp
+
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import aiohttp_client
+
+from .const import (
+    APPLIANCES_URL,
+    AUTH_AUDIENCE,
+    AUTH_REALM,
+    AUTH_SCOPE,
+    AUTH_URL,
+    CLIENT_ID,
+    JOULE_MODEL,
+    USER_AGENT,
+    WEBSOCKET_URL,
+)
+from .models import BrevilleAppliance, BrevilleJouleData
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class BrevilleAuthenticationError(HomeAssistantError):
+    """Error to indicate authentication failure."""
+
+
+class BrevilleConnectionError(HomeAssistantError):
+    """Error to indicate connection failure."""
+
+
+class BrevilleJouleClient:
+    """Client for communicating with Breville Joule API."""
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        username: str,
+        password: str,
+    ) -> None:
+        """Initialize the client."""
+        self.hass = hass
+        self.username = username
+        self.password = password
+        self.polling_interval = 30  # Fixed 30 second interval
+        self._access_token: str | None = None
+        self._user_id: str | None = None
+        self._appliances: list[BrevilleAppliance] = []
+        self._ws: WebSocketApp | None = None
+        self._data: dict[str, BrevilleJouleData] = {}
+        self._connected = False
+        self._listeners: list = []
+
+    async def async_authenticate(self) -> None:
+        """Authenticate with Breville API."""
+        auth_payload = {
+            "username": self.username,
+            "password": self.password,
+            "realm": AUTH_REALM,
+            "scope": AUTH_SCOPE,
+            "audience": AUTH_AUDIENCE,
+            "client_id": CLIENT_ID,
+            "grant_type": "http://auth0.com/oauth/grant-type/password-realm",
+        }
+        auth_headers = {
+            "accept": "application/json",
+            "content-type": "application/json",
+            "user-agent": USER_AGENT,
+        }
+
+        def _handle_auth_response_error(status: int) -> None:
+            """Handle authentication response errors."""
+            if status == 401:
+                raise BrevilleAuthenticationError("Invalid username or password")
+            elif status == 403:
+                raise BrevilleAuthenticationError("Access denied - check credentials")
+            elif status >= 500:
+                raise BrevilleConnectionError("Breville server error")
+            elif status >= 400:
+                raise BrevilleAuthenticationError(f"Client error: {status}")
+
+        session = aiohttp_client.async_get_clientsession(self.hass)
+        try:
+            async with session.post(
+                AUTH_URL, json=auth_payload, headers=auth_headers
+            ) as resp:
+                _handle_auth_response_error(resp.status)
+                resp.raise_for_status()
+                token_data = await resp.json()
+                self._access_token = token_data["id_token"]
+                self._user_id = jwt.decode(
+                    self._access_token,
+                    options={"verify_signature": False},
+                    algorithms=["RS256"],
+                )["sub"]
+        except (aiohttp.ClientError, asyncio.TimeoutError) as ex:
+            _LOGGER.error("Network error during authentication: %s", ex)
+            raise BrevilleConnectionError("Cannot connect to Breville servers") from ex
+        except (BrevilleAuthenticationError, BrevilleConnectionError):
+            raise
+        except Exception as ex:
+            _LOGGER.error("Unexpected error during authentication: %s", ex)
+            raise HomeAssistantError("Authentication failed") from ex
+
+    async def async_get_appliances(self) -> list[BrevilleAppliance]:
+        """Get list of appliances."""
+        if not self._access_token or not self._user_id:
+            await self.async_authenticate()
+
+        def _handle_response_error(status: int) -> None:
+            """Handle HTTP response errors."""
+            if status == 401:
+                raise BrevilleAuthenticationError("Token expired or invalid")
+            elif status == 403:
+                raise BrevilleAuthenticationError("Access denied to appliances")
+            elif status >= 500:
+                raise BrevilleConnectionError("Breville server error")
+            elif status >= 400:
+                raise BrevilleConnectionError(f"Client error: {status}")
+
+        session = aiohttp_client.async_get_clientsession(self.hass)
+        try:
+            async with session.get(
+                APPLIANCES_URL.format(user_id=urllib.parse.quote(self._user_id)),
+                headers={"sf-id-token": self._access_token},
+            ) as resp:
+                _handle_response_error(resp.status)
+                resp.raise_for_status()
+                appliances_data = await resp.json()
+                appliances = appliances_data.get("appliances", [])
+
+                self._appliances = [
+                    BrevilleAppliance(
+                        serial_number=appliance["serialNumber"],
+                        model=appliance["model"],
+                        name=appliance.get("name"),
+                    )
+                    for appliance in appliances
+                    if appliance["model"] == JOULE_MODEL
+                ]
+
+                # Initialize data for each appliance
+                for appliance in self._appliances:
+                    if appliance.serial_number not in self._data:
+                        self._data[appliance.serial_number] = BrevilleJouleData(
+                            serial_number=appliance.serial_number
+                        )
+
+                return self._appliances
+        except (aiohttp.ClientError, asyncio.TimeoutError) as ex:
+            _LOGGER.error("Network error getting appliances: %s", ex)
+            raise BrevilleConnectionError("Cannot connect to Breville servers") from ex
+        except (BrevilleAuthenticationError, BrevilleConnectionError):
+            raise
+        except Exception as ex:
+            _LOGGER.error("Unexpected error getting appliances: %s", ex)
+
+        if not self._appliances:
+            await self.async_get_appliances()
+
+        try:
+            self._ws = WebSocketApp(
+                WEBSOCKET_URL,
+                header={"sf-id-token": self._access_token},
+                on_message=self._on_message,
+                on_error=self._on_error,
+                on_close=self._on_close,
+                on_open=self._on_open,
+            )
+
+            # Run WebSocket in a separate thread
+            def run_websocket():
+                """Run WebSocket in thread."""
+                self._ws.run_forever()
+
+            ws_thread = threading.Thread(target=run_websocket, daemon=True)
+            ws_thread.start()
+
+            # Wait a bit for connection to establish
+            await asyncio.sleep(1)
+
+        except Exception as ex:
+            _LOGGER.error("Failed to connect WebSocket: %s", ex)
+            raise HomeAssistantError("WebSocket connection failed") from ex
+
+    def _on_open(self, ws) -> None:
+        """Handle WebSocket open event."""
+        _LOGGER.debug("WebSocket connection opened")
+        self._connected = True
+
+        # Add appliances to WebSocket
+        for appliance in self._appliances:
+            add_appliance = {
+                "action": "addAppliance",
+                "serialNumber": appliance.serial_number,
+            }
+            ws.send(json.dumps(add_appliance))
+
+        # Start ping and polling tasks
+        asyncio.run_coroutine_threadsafe(self._async_ping_loop(), self.hass.loop)
+        asyncio.run_coroutine_threadsafe(self._async_poll_loop(), self.hass.loop)
+
+    def _on_message(self, ws, message: str) -> None:
+        """Handle incoming WebSocket messages."""
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._handle_websocket_message(message), self.hass.loop
+            )
+        except Exception as ex:
+            _LOGGER.error("Failed to handle WebSocket message: %s", ex)
+
+    def _on_error(self, ws, error) -> None:
+        """Handle WebSocket error."""
+        _LOGGER.error("WebSocket error: %s", error)
+        self._connected = False
+
+    def _on_close(self, ws, close_status_code, close_msg) -> None:
+        """Handle WebSocket close."""
+        _LOGGER.info("WebSocket connection closed: %s", close_msg)
+        self._connected = False
+
+    async def _handle_websocket_message(self, message: str) -> None:
+        """Handle incoming WebSocket messages."""
+        try:
+            data = json.loads(message)
+            if data.get("messageType") != "stateReport":
+                return
+
+            reported = data.get("data", {}).get("reported", {})
+            if not isinstance(reported, dict):
+                return
+
+            # Extract serial number (would need to be included in the message)
+            # For now, update the first appliance
+            if not self._appliances:
+                return
+
+            serial_number = self._appliances[0].serial_number
+            device_data = self._data.get(serial_number)
+            if not device_data:
+                return
+
+            # Parse timer information
+            has_timer = False
+            if timers := reported.get("timers"):
+                if isinstance(timers, list) and timers:
+                    timer = timers[0]
+                    if "timestamp" in timer:
+                        has_timer = True
+                        device_data.start_time = timer.get("timestamp")
+                    if "down_from_n" in timer:
+                        device_data.end_time = timer.get("timestamp", 0) + timer.get(
+                            "down_from_n", 0
+                        )
+
+            device_data.is_active = has_timer
+
+            # Parse temperature information
+            if heaters := reported.get("heaters"):
+                if isinstance(heaters, list) and heaters:
+                    heater = heaters[0]
+                    device_data.target_temperature = heater.get("temp_sp")
+                    device_data.current_temperature = heater.get("cur_temp")
+
+            # Notify listeners
+            for listener in self._listeners:
+                listener()
+
+        except Exception as ex:
+            _LOGGER.error("Error parsing WebSocket message: %s", ex)
+
+    async def _async_ping_loop(self) -> None:
+        """Send periodic ping messages."""
+        while self._connected and self._ws:
+            await asyncio.sleep(20)
+            if (
+                self._ws
+                and hasattr(self._ws, "sock")
+                and self._ws.sock
+                and self._ws.sock.connected
+            ):
+                try:
+                    self._ws.send(json.dumps({"action": "ping"}))
+                except Exception as ex:
+                    _LOGGER.error("Failed to send ping: %s", ex)
+                    break
+
+    async def _async_poll_loop(self) -> None:
+        """Send periodic polling messages."""
+        while self._connected and self._ws:
+            await asyncio.sleep(self.polling_interval)
+            if (
+                self._ws
+                and hasattr(self._ws, "sock")
+                and self._ws.sock
+                and self._ws.sock.connected
+            ):
+                try:
+                    for appliance in self._appliances:
+                        add_appliance = {
+                            "action": "addAppliance",
+                            "serialNumber": appliance.serial_number,
+                        }
+                        self._ws.send(json.dumps(add_appliance))
+                except Exception as ex:
+                    _LOGGER.error("Failed to send poll message: %s", ex)
+                    break
+
+    def add_listener(self, listener) -> None:
+        """Add a listener for data updates."""
+        self._listeners.append(listener)
+
+    def remove_listener(self, listener) -> None:
+        """Remove a data update listener."""
+        if listener in self._listeners:
+            self._listeners.remove(listener)
+
+    def get_data(self, serial_number: str) -> BrevilleJouleData | None:
+        """Get data for a specific appliance."""
+        return self._data.get(serial_number)
+
+    def get_all_data(self) -> dict[str, BrevilleJouleData]:
+        """Get data for all appliances."""
+        return self._data.copy()
+
+    async def async_disconnect(self) -> None:
+        """Disconnect from WebSocket."""
+        self._connected = False
+        if self._ws:
+            await self.hass.async_add_executor_job(self._ws.close)
+            self._ws = None

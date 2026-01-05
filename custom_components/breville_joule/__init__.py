@@ -1,42 +1,46 @@
-"""The breville_joule integration."""
+"""The Breville Joule integration."""
 
 from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.typing import ConfigType
-
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 from .const import DOMAIN
-from .sensor import BrevilleAuth
+from .coordinator import BrevilleJouleDataUpdateCoordinator
+
+if TYPE_CHECKING:
+    from .models import BrevilleJouleConfigEntry
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 
+_LOGGER = logging.getLogger(__name__)
 
-async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up the Breville Joule integration using YAML configuration."""
-    if DOMAIN not in config:
-        return True
 
-    hass.data.setdefault(DOMAIN, {})
+async def async_setup_entry(
+    hass: HomeAssistant, entry: BrevilleJouleConfigEntry
+) -> bool:
+    """Set up Breville Joule from a config entry."""
+    coordinator = BrevilleJouleDataUpdateCoordinator(hass, entry)
 
-    username = config[DOMAIN].get("username")
-    password = config[DOMAIN].get("password")
+    await coordinator.async_config_entry_first_refresh()
 
-    polling_interval = config[DOMAIN].get("polling_interval")
+    entry.runtime_data = coordinator
 
-    auth = BrevilleAuth(hass, username, password, polling_interval)
-    hass.data[DOMAIN]["auth"] = auth
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    hass.async_create_task(
-        hass.helpers.discovery.async_load_platform("sensor", DOMAIN, {}, config)
-    )
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(
+    hass: HomeAssistant, entry: BrevilleJouleConfigEntry
+) -> bool:
     """Unload a config entry."""
-    return False  # Not applicable as we're not using config entries.
+    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        if hasattr(entry.runtime_data, "client") and entry.runtime_data.client:
+            await entry.runtime_data.client.async_disconnect()
+
+    return unload_ok

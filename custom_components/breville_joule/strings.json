@@ -1,0 +1,59 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Breville Joule Setup",
+        "description": "Enter your Breville account credentials",
+        "data": {
+          "username": "Username",
+          "password": "Password"
+        },
+        "data_description": {
+          "username": "Your Breville account email address",
+          "password": "Your Breville account password"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate Breville Joule",
+        "description": "Your credentials have expired. Please enter your current credentials.",
+        "data": {
+          "username": "Username",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to Breville servers. Please check your internet connection and try again.",
+      "invalid_auth": "Invalid username or password. Please check your credentials and try again.",
+      "no_appliances": "No Breville Joule devices found in your account. Please ensure your device is registered.",
+      "unknown": "An unexpected error occurred. Please try again."
+    },
+    "abort": {
+      "already_configured": "This Breville account is already configured.",
+      "reauth_successful": "Re-authentication was successful"
+    }
+  },
+  "entity": {
+    "sensor": {
+      "current_temperature": {
+        "name": "Current temperature"
+      },
+      "target_temperature": {
+        "name": "Target temperature"
+      },
+      "start_time": {
+        "name": "Start time"
+      },
+      "end_time": {
+        "name": "End time"
+      },
+      "cooking_state": {
+        "name": "Cooking state",
+        "state": {
+          "idle": "Idle",
+          "active": "Active"
+        }
+      }
+    }
+  }
+}
