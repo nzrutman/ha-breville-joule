@@ -7,6 +7,7 @@ import json
 import logging
 import threading
 import urllib.parse
+from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
@@ -41,6 +42,27 @@ class BrevilleConnectionError(HomeAssistantError):
     """Error to indicate connection failure."""
 
 
+@dataclass
+class BrevilleAppliance:
+    """Represent a Breville appliance."""
+
+    id: str
+    name: str
+    model: str
+    serial_number: str  # Add this attribute
+    # ... other existing fields ...
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "BrevilleAppliance":
+        """Create BrevilleAppliance from dictionary data."""
+        return cls(
+            id=data["id"],
+            name=data["name"],
+            model=data.get("model", "Unknown"),
+            serial_number=data["serialNumber"],
+        )
+
+
 class BrevilleJouleClient:
     """Client for communicating with Breville Joule API."""
 
@@ -64,52 +86,26 @@ class BrevilleJouleClient:
         self._listeners: list = []
 
     async def async_authenticate(self) -> None:
-        """Authenticate with Breville API."""
+        """Authenticate with Breville servers."""
         auth_payload = {
-            "username": self.username,
+            "email": self.username,
             "password": self.password,
-            "realm": AUTH_REALM,
-            "scope": AUTH_SCOPE,
-            "audience": AUTH_AUDIENCE,
-            "client_id": CLIENT_ID,
-            "grant_type": "http://auth0.com/oauth/grant-type/password-realm",
         }
         auth_headers = {
-            "accept": "application/json",
-            "content-type": "application/json",
-            "user-agent": USER_AGENT,
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
         }
 
-        def _handle_auth_response_error(status: int, response_text: str = "") -> None:
+        def _handle_auth_response_error(status: int, response_text: str) -> None:
             """Handle authentication response errors."""
-            if status == 401:
-                # Try to parse error details from response
-                error_detail = "Invalid username or password"
-                if "unauthorized" in response_text.lower():
-                    error_detail = "Incorrect username or password"
-                elif "invalid_grant" in response_text.lower():
-                    error_detail = "Invalid credentials provided"
-                elif (
-                    "account" in response_text.lower()
-                    and "locked" in response_text.lower()
-                ):
-                    error_detail = (
-                        "Account may be locked. Please check your Breville account."
-                    )
-                _LOGGER.debug("Authentication error (401): %s", response_text)
-                raise BrevilleAuthenticationError(error_detail)
-            elif status == 403:
-                error_detail = "Access denied - check credentials"
-                if "forbidden" in response_text.lower():
-                    error_detail = "Account access denied. Please verify your Breville account is active."
-                _LOGGER.debug("Access denied error (403): %s", response_text)
-                raise BrevilleAuthenticationError(error_detail)
-            elif status >= 500:
-                _LOGGER.debug("Server error (%d): %s", status, response_text)
-                raise BrevilleConnectionError(f"Breville server error ({status})")
-            elif status >= 400:
+            if status in (400, 401, 403):
                 _LOGGER.debug("Client error (%d): %s", status, response_text)
                 raise BrevilleAuthenticationError(f"Authentication error ({status})")
+
+        def _handle_unexpected_error(ex: Exception) -> None:
+            """Handle unexpected errors during authentication."""
+            _LOGGER.error("Unexpected error during authentication: %s", ex)
+            raise BrevilleConnectionError("Unexpected authentication error") from ex
 
         session = aiohttp_client.async_get_clientsession(self.hass)
         try:
@@ -132,24 +128,41 @@ class BrevilleJouleClient:
                 resp.raise_for_status()
 
                 token_data = await resp.json()
-                self._access_token = token_data["id_token"]
-                self._user_id = jwt.decode(
-                    self._access_token,
-                    options={"verify_signature": False},
-                    algorithms=["RS256"],
-                )["sub"]
+                id_token = token_data.get("id_token")
+                if not id_token:
+                    raise BrevilleAuthenticationError(
+                        "No ID token received from server"
+                    )
+
+                self._access_token = id_token
+
+                # Decode and validate JWT payload
+                try:
+                    jwt_payload = jwt.decode(
+                        id_token,
+                        options={"verify_signature": False},
+                        algorithms=["RS256"],
+                    )
+                except jwt.InvalidTokenError as ex:
+                    raise BrevilleAuthenticationError("Invalid ID token format") from ex
+
+                if not isinstance(jwt_payload, dict) or "sub" not in jwt_payload:
+                    raise BrevilleAuthenticationError(
+                        "Invalid ID token: missing user ID"
+                    )
+
+                self._user_id = jwt_payload["sub"]
                 _LOGGER.debug(
                     "Authentication successful for user ID: %s",
-                    self._user_id[:8] + "...",
+                    self._user_id[:8] + "..." if self._user_id else "unknown",
                 )
-        except (aiohttp.ClientError, asyncio.TimeoutError) as ex:
+        except (aiohttp.ClientError, TimeoutError) as ex:
             _LOGGER.error("Network error during authentication: %s", ex)
             raise BrevilleConnectionError("Cannot connect to Breville servers") from ex
         except (BrevilleAuthenticationError, BrevilleConnectionError):
             raise
         except Exception as ex:
-            _LOGGER.error("Unexpected error during authentication: %s", ex)
-            raise HomeAssistantError("Authentication failed") from ex
+            _handle_unexpected_error(ex)
 
     async def async_get_appliances(self) -> list[BrevilleAppliance]:
         """Get list of appliances."""
@@ -170,73 +183,67 @@ class BrevilleJouleClient:
                     status,
                     response_text,
                 )
-                raise BrevilleConnectionError(f"Breville server error ({status})")
-            elif status >= 400:
-                _LOGGER.debug(
-                    "Client error during appliance fetch (%d): %s",
-                    status,
-                    response_text,
-                )
-                raise BrevilleConnectionError(f"Request error ({status})")
+                raise BrevilleConnectionError("Server error while fetching appliances")
+
+        def _handle_unexpected_error(ex: Exception) -> None:
+            """Handle unexpected errors during appliance fetching."""
+            _LOGGER.error("Unexpected error fetching appliances: %s", ex)
+            raise BrevilleConnectionError(
+                "Unexpected error fetching appliances"
+            ) from ex
+
+        headers = {
+            "Authorization": f"Bearer {self._access_token}",
+            "User-Agent": USER_AGENT,
+        }
 
         session = aiohttp_client.async_get_clientsession(self.hass)
         try:
             async with session.get(
-                APPLIANCES_URL.format(user_id=urllib.parse.quote(self._user_id)),
-                headers={"sf-id-token": self._access_token},
+                f"{APPLIANCES_URL}/{self._user_id}/appliances", headers=headers
             ) as resp:
-                # Read response text for error context
                 response_text = ""
                 try:
-                    response_text = await resp.text() if resp.status >= 400 else ""
-                    if resp.status >= 400:
-                        _LOGGER.debug(
-                            "Appliances API error status: %d, content length: %d",
-                            resp.status,
-                            len(response_text),
-                        )
+                    response_text = await resp.text()
                 except Exception as ex:
-                    _LOGGER.debug("Could not read appliances response text: %s", ex)
+                    _LOGGER.debug("Could not read response text: %s", ex)
 
                 _handle_response_error(resp.status, response_text)
                 resp.raise_for_status()
 
                 appliances_data = await resp.json()
-                appliances = appliances_data.get("appliances", [])
 
-                _LOGGER.debug("Successfully fetched %d appliances", len(appliances))
+                # Process and return the appliances list
+                appliances = []
+                for appliance_data in appliances_data.get("appliances", []):
+                    try:
+                        appliance = BrevilleAppliance.from_dict(appliance_data)
+                        appliances.append(appliance)
+                    except Exception as ex:
+                        _LOGGER.warning("Failed to parse appliance data: %s", ex)
+                        continue
 
-                self._appliances = [
-                    BrevilleAppliance(
-                        serial_number=appliance["serialNumber"],
-                        model=appliance["model"],
-                        name=appliance.get("name"),
-                    )
-                    for appliance in appliances
-                    if appliance["model"] == JOULE_MODEL
-                ]
+            self._appliances = appliances
+            return appliances
 
-                # Initialize data for each appliance
-                for appliance in self._appliances:
-                    if appliance.serial_number not in self._data:
-                        self._data[appliance.serial_number] = BrevilleJouleData(
-                            serial_number=appliance.serial_number
-                        )
-
-                return self._appliances
-        except (aiohttp.ClientError, asyncio.TimeoutError) as ex:
-            _LOGGER.error("Network error getting appliances: %s", ex)
+        except (aiohttp.ClientError, TimeoutError) as ex:
+            _LOGGER.error("Network error during appliance fetch: %s", ex)
             raise BrevilleConnectionError("Cannot connect to Breville servers") from ex
         except (BrevilleAuthenticationError, BrevilleConnectionError):
             raise
         except Exception as ex:
-            _LOGGER.error("Unexpected error getting appliances: %s", ex)
+            _handle_unexpected_error(ex)
 
         if not self._appliances:
             await self.async_get_appliances()
 
+        if not self._access_token:
+            raise BrevilleAuthenticationError(
+                "No access token available for WebSocket connection"
+            )
+
         try:
-            self._ws = WebSocketApp(
+            ws = WebSocketApp(
                 WEBSOCKET_URL,
                 header={"sf-id-token": self._access_token},
                 on_message=self._on_message,
@@ -245,10 +252,16 @@ class BrevilleJouleClient:
                 on_open=self._on_open,
             )
 
+            if not ws:
+                raise BrevilleConnectionError("Failed to create WebSocket connection")
+
+            self._ws = ws
+
             # Run WebSocket in a separate thread
             def run_websocket():
                 """Run WebSocket in thread."""
-                self._ws.run_forever()
+                if self._ws:
+                    self._ws.run_forever()
 
             ws_thread = threading.Thread(target=run_websocket, daemon=True)
             ws_thread.start()
