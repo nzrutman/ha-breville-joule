@@ -80,24 +80,57 @@ class BrevilleJouleClient:
             "user-agent": USER_AGENT,
         }
 
-        def _handle_auth_response_error(status: int) -> None:
+        def _handle_auth_response_error(status: int, response_text: str = "") -> None:
             """Handle authentication response errors."""
             if status == 401:
-                raise BrevilleAuthenticationError("Invalid username or password")
+                # Try to parse error details from response
+                error_detail = "Invalid username or password"
+                if "unauthorized" in response_text.lower():
+                    error_detail = "Incorrect username or password"
+                elif "invalid_grant" in response_text.lower():
+                    error_detail = "Invalid credentials provided"
+                elif (
+                    "account" in response_text.lower()
+                    and "locked" in response_text.lower()
+                ):
+                    error_detail = (
+                        "Account may be locked. Please check your Breville account."
+                    )
+                _LOGGER.debug("Authentication error (401): %s", response_text)
+                raise BrevilleAuthenticationError(error_detail)
             elif status == 403:
-                raise BrevilleAuthenticationError("Access denied - check credentials")
+                error_detail = "Access denied - check credentials"
+                if "forbidden" in response_text.lower():
+                    error_detail = "Account access denied. Please verify your Breville account is active."
+                _LOGGER.debug("Access denied error (403): %s", response_text)
+                raise BrevilleAuthenticationError(error_detail)
             elif status >= 500:
-                raise BrevilleConnectionError("Breville server error")
+                _LOGGER.debug("Server error (%d): %s", status, response_text)
+                raise BrevilleConnectionError(f"Breville server error ({status})")
             elif status >= 400:
-                raise BrevilleAuthenticationError(f"Client error: {status}")
+                _LOGGER.debug("Client error (%d): %s", status, response_text)
+                raise BrevilleAuthenticationError(f"Authentication error ({status})")
 
         session = aiohttp_client.async_get_clientsession(self.hass)
         try:
             async with session.post(
                 AUTH_URL, json=auth_payload, headers=auth_headers
             ) as resp:
-                _handle_auth_response_error(resp.status)
+                # Read response text for error context
+                response_text = ""
+                try:
+                    response_text = await resp.text()
+                    _LOGGER.debug(
+                        "Auth response status: %d, content length: %d",
+                        resp.status,
+                        len(response_text),
+                    )
+                except Exception as ex:
+                    _LOGGER.debug("Could not read response text: %s", ex)
+
+                _handle_auth_response_error(resp.status, response_text)
                 resp.raise_for_status()
+
                 token_data = await resp.json()
                 self._access_token = token_data["id_token"]
                 self._user_id = jwt.decode(
@@ -105,6 +138,10 @@ class BrevilleJouleClient:
                     options={"verify_signature": False},
                     algorithms=["RS256"],
                 )["sub"]
+                _LOGGER.debug(
+                    "Authentication successful for user ID: %s",
+                    self._user_id[:8] + "...",
+                )
         except (aiohttp.ClientError, asyncio.TimeoutError) as ex:
             _LOGGER.error("Network error during authentication: %s", ex)
             raise BrevilleConnectionError("Cannot connect to Breville servers") from ex
@@ -119,16 +156,28 @@ class BrevilleJouleClient:
         if not self._access_token or not self._user_id:
             await self.async_authenticate()
 
-        def _handle_response_error(status: int) -> None:
+        def _handle_response_error(status: int, response_text: str = "") -> None:
             """Handle HTTP response errors."""
             if status == 401:
-                raise BrevilleAuthenticationError("Token expired or invalid")
+                _LOGGER.debug("Token expired or invalid (401): %s", response_text)
+                raise BrevilleAuthenticationError("Authentication token expired")
             elif status == 403:
-                raise BrevilleAuthenticationError("Access denied to appliances")
+                _LOGGER.debug("Access denied to appliances (403): %s", response_text)
+                raise BrevilleAuthenticationError("Access denied to appliance data")
             elif status >= 500:
-                raise BrevilleConnectionError("Breville server error")
+                _LOGGER.debug(
+                    "Server error during appliance fetch (%d): %s",
+                    status,
+                    response_text,
+                )
+                raise BrevilleConnectionError(f"Breville server error ({status})")
             elif status >= 400:
-                raise BrevilleConnectionError(f"Client error: {status}")
+                _LOGGER.debug(
+                    "Client error during appliance fetch (%d): %s",
+                    status,
+                    response_text,
+                )
+                raise BrevilleConnectionError(f"Request error ({status})")
 
         session = aiohttp_client.async_get_clientsession(self.hass)
         try:
@@ -136,10 +185,26 @@ class BrevilleJouleClient:
                 APPLIANCES_URL.format(user_id=urllib.parse.quote(self._user_id)),
                 headers={"sf-id-token": self._access_token},
             ) as resp:
-                _handle_response_error(resp.status)
+                # Read response text for error context
+                response_text = ""
+                try:
+                    response_text = await resp.text() if resp.status >= 400 else ""
+                    if resp.status >= 400:
+                        _LOGGER.debug(
+                            "Appliances API error status: %d, content length: %d",
+                            resp.status,
+                            len(response_text),
+                        )
+                except Exception as ex:
+                    _LOGGER.debug("Could not read appliances response text: %s", ex)
+
+                _handle_response_error(resp.status, response_text)
                 resp.raise_for_status()
+
                 appliances_data = await resp.json()
                 appliances = appliances_data.get("appliances", [])
+
+                _LOGGER.debug("Successfully fetched %d appliances", len(appliances))
 
                 self._appliances = [
                     BrevilleAppliance(

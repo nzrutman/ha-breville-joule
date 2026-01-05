@@ -34,6 +34,8 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
 
     Data has the keys from STEP_USER_DATA_SCHEMA with values provided by the user.
     """
+    _LOGGER.debug("Validating input for username: %s", data[CONF_USERNAME])
+
     client = BrevilleJouleClient(
         hass,
         data[CONF_USERNAME],
@@ -42,16 +44,25 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
 
     # Test the connection
     try:
+        _LOGGER.debug("Attempting authentication for user: %s", data[CONF_USERNAME])
         await client.async_authenticate()
+
+        _LOGGER.debug("Authentication successful, fetching appliances")
         appliances = await client.async_get_appliances()
 
+        _LOGGER.debug("Found %d appliances", len(appliances))
         if not appliances:
+            _LOGGER.warning("No appliances found for user: %s", data[CONF_USERNAME])
             raise NoAppliances
+
     except BrevilleAuthenticationError as err:
+        _LOGGER.debug("Authentication failed for user %s: %s", data[CONF_USERNAME], err)
         raise InvalidAuth from err
     except BrevilleConnectionError as err:
+        _LOGGER.debug("Connection failed for user %s: %s", data[CONF_USERNAME], err)
         raise CannotConnect from err
 
+    _LOGGER.debug("Validation successful for user: %s", data[CONF_USERNAME])
     return {"title": f"Breville Joule ({data[CONF_USERNAME]})"}
 
 
@@ -67,18 +78,42 @@ class BrevilleJouleConfigFlow(ConfigFlow, domain=DOMAIN):
         """Handle the initial step."""
         errors: dict[str, str] = {}
         if user_input is not None:
+            _LOGGER.debug(
+                "Processing config flow input for user: %s",
+                user_input.get(CONF_USERNAME),
+            )
             try:
                 info = await validate_input(self.hass, user_input)
-            except CannotConnect:
+            except CannotConnect as err:
+                _LOGGER.warning(
+                    "Cannot connect to Breville servers for user %s: %s",
+                    user_input.get(CONF_USERNAME),
+                    err,
+                )
                 errors["base"] = "cannot_connect"
-            except NoAppliances:
+            except NoAppliances as err:
+                _LOGGER.warning(
+                    "No appliances found for user %s: %s",
+                    user_input.get(CONF_USERNAME),
+                    err,
+                )
                 errors["base"] = "no_appliances"
-            except InvalidAuth:
+            except InvalidAuth as err:
+                _LOGGER.warning(
+                    "Authentication failed for user %s: %s",
+                    user_input.get(CONF_USERNAME),
+                    err,
+                )
                 errors["base"] = "invalid_auth"
-            except Exception:
-                _LOGGER.exception("Unexpected exception")
+            except Exception as err:
+                _LOGGER.exception(
+                    "Unexpected exception during config flow for user %s: %s",
+                    user_input.get(CONF_USERNAME),
+                    err,
+                )
                 errors["base"] = "unknown"
             else:
+                _LOGGER.debug("Config flow validation successful, creating entry")
                 # Set unique ID based on username
                 await self.async_set_unique_id(user_input[CONF_USERNAME])
                 self._abort_if_unique_id_configured()
@@ -114,18 +149,39 @@ class BrevilleJouleConfigFlow(ConfigFlow, domain=DOMAIN):
             )
 
         errors: dict[str, str] = {}
+        _LOGGER.debug("Processing reauth for user: %s", user_input.get(CONF_USERNAME))
         try:
             await validate_input(self.hass, {**reauth_entry.data, **user_input})
-        except CannotConnect:
+        except CannotConnect as err:
+            _LOGGER.warning(
+                "Cannot connect during reauth for user %s: %s",
+                user_input.get(CONF_USERNAME),
+                err,
+            )
             errors["base"] = "cannot_connect"
-        except NoAppliances:
+        except NoAppliances as err:
+            _LOGGER.warning(
+                "No appliances found during reauth for user %s: %s",
+                user_input.get(CONF_USERNAME),
+                err,
+            )
             errors["base"] = "no_appliances"
-        except InvalidAuth:
+        except InvalidAuth as err:
+            _LOGGER.warning(
+                "Authentication failed during reauth for user %s: %s",
+                user_input.get(CONF_USERNAME),
+                err,
+            )
             errors["base"] = "invalid_auth"
-        except Exception:
-            _LOGGER.exception("Unexpected exception")
+        except Exception as err:
+            _LOGGER.exception(
+                "Unexpected exception during reauth for user %s: %s",
+                user_input.get(CONF_USERNAME),
+                err,
+            )
             errors["base"] = "unknown"
         else:
+            _LOGGER.debug("Reauth successful, updating entry")
             return self.async_update_reload_and_abort(
                 reauth_entry,
                 data_updates=user_input,

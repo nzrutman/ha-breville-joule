@@ -23,10 +23,10 @@
       }
     },
     "error": {
-      "cannot_connect": "Failed to connect to Breville servers. Please check your internet connection and try again.",
-      "invalid_auth": "Invalid username or password. Please check your credentials and try again.",
-      "no_appliances": "No Breville Joule devices found in your account. Please ensure your device is registered.",
-      "unknown": "An unexpected error occurred. Please try again."
+      "cannot_connect": "Failed to connect to Breville servers. Please check your internet connection and try again. If the problem persists, Breville services may be temporarily unavailable.",
+      "invalid_auth": "Authentication failed. Please verify your Breville account email and password are correct. Make sure your account is active and not locked.",
+      "no_appliances": "No Breville Joule devices found in your account. Please ensure your device is registered in the Breville app and try again.",
+      "unknown": "An unexpected error occurred during setup. Please check the Home Assistant logs for more details and try again."
     },
     "abort": {
       "already_configured": "This Breville account is already configured.",
